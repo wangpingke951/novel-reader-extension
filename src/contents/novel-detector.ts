@@ -180,19 +180,30 @@ function injectButton(): void {
     btn.textContent = "⏳";
     btn.style.pointerEvents = "none";
     try {
+      // Step 1: 提取内容
       const data = extract();
-      if (!data) { toast("❌ 未识别到章节内容"); return; }
+      if (!data) {
+        toast("❌ 未识别到章节内容");
+        btn.textContent = "📖";
+        btn.style.pointerEvents = "auto";
+        return;
+      }
+      toast(`📋 提取成功: ${data.title} (${data.content.length}字)`);
 
-      // 优先发送到桌面透明窗
+      // Step 2: 发送到桌面
+      console.log("[起点阅读] 开始发送到桌面...", { title: data.title, len: data.content.length });
       const sent = await sendToDesktopApp(data);
+      console.log("[起点阅读] sendToDesktopApp 返回:", sent);
+
       if (sent) {
         toast("✅ 已发送到桌面窗");
       } else {
-        // 桌面程序未运行 → 回退到页面内悬浮面板
+        toast("⚠️ 桌面程序未连接，回退到页内面板");
         injectReadingPanel(data);
       }
-    } catch {
-      toast("❌ 失败，请重试");
+    } catch (err: any) {
+      console.error("[起点阅读] 错误:", err);
+      toast(`❌ 异常: ${err.message || String(err)}`);
     } finally {
       btn.textContent = "📖";
       btn.style.pointerEvents = "auto";
@@ -210,7 +221,8 @@ const DESKTOP_URL = "http://127.0.0.1:19876/api/content";
 async function sendToDesktopApp(data: { title: string; content: string }): Promise<boolean> {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 1500);
+    const timeout = setTimeout(() => controller.abort(), 2000);
+    console.log("[起点阅读] fetch POST to", DESKTOP_URL);
     const res = await fetch(DESKTOP_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -218,9 +230,10 @@ async function sendToDesktopApp(data: { title: string; content: string }): Promi
       signal: controller.signal,
     });
     clearTimeout(timeout);
+    console.log("[起点阅读] fetch 响应:", res.status, res.statusText);
     return res.ok;
-  } catch {
-    // 连接失败 = 桌面程序未运行
+  } catch (err: any) {
+    console.error("[起点阅读] fetch 异常:", err.message || String(err));
     return false;
   }
 }

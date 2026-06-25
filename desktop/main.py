@@ -52,6 +52,20 @@ class ReaderApi:
         if window:
             window.destroy()
 
+    def minimize(self):
+        if window:
+            window.minimize()
+
+    def toggle_maximize(self):
+        if window:
+            if window.width > 500:
+                window.resize(440, 700)
+            else:
+                screen_w = user32.GetSystemMetrics(0)
+                screen_h = user32.GetSystemMetrics(1)
+                window.resize(screen_w, screen_h)
+                window.move(0, 0)
+
     def start_drag(self, sx, sy):
         """记录拖拽起点（屏幕坐标）"""
         hwnd = user32.FindWindowW(None, "起点阅读")
@@ -85,13 +99,22 @@ class ReaderApi:
 # ── HTTP 服务 ──
 http_app = Bottle()
 
+@http_app.hook("after_request")
+def enable_cors():
+    """允许浏览器扩展跨域访问"""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+
 @http_app.route("/api/health")
 def health():
     response.content_type = "application/json"
     return json.dumps({"status": "ok"})
 
-@http_app.route("/api/content", method="POST")
+@http_app.route("/api/content", method=["POST", "OPTIONS"])
 def receive_content():
+    if request.method == "OPTIONS":
+        return ""
     data = request.json
     if not data:
         response.status = 400
@@ -123,12 +146,11 @@ READING_HTML = r"""
 
   .wrapper { display: flex; flex-direction: column; height: 100%; border-radius: 12px; overflow: hidden; background: var(--bg); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); transition: background .3s; }
 
-  .toolbar { display: flex; align-items: center; gap: 6px; padding: 6px 12px; flex-shrink: 0; cursor: default; user-select: none; background: var(--btn-bg); transition: background .3s; }
+  .toolbar { display: flex; align-items: center; gap: 4px; padding: 4px 8px 4px 14px; flex-shrink: 0; cursor: default; user-select: none; background: var(--btn-bg); transition: background .3s; }
   .toolbar-title { flex: 1; min-width: 0; font-size: 11px; font-weight: 500; opacity: 0.45; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--tc); }
-  .tb-btn { width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; border-radius: 6px; border: none; cursor: pointer; font-size: 11px; font-weight: 600; background: transparent; color: var(--tc); transition: background .15s; }
-  .tb-btn:hover { background: rgba(128,128,128,0.15); }
-  .tb-btn.close:hover { background: rgba(239,68,68,0.2); color: #ef4444; }
-  .tb-label { font-size: 10px; min-width: 20px; text-align: center; color: var(--tc); }
+  .win-btn { width: 32px; height: 26px; display: flex; align-items: center; justify-content: center; border-radius: 4px; border: none; cursor: pointer; font-size: 12px; background: transparent; color: var(--tc); transition: background .15s; font-family: "Segoe MDL2 Assets", "Segoe UI Symbol", sans-serif; }
+  .win-btn:hover { background: rgba(128,128,128,0.2); }
+  .win-btn.close:hover { background: #e81123; color: #fff; }
 
   .content { flex: 1; overflow-y: auto; padding: 10px 22px 28px; font-size: var(--font); line-height: 1.9; color: var(--tc); transition: color .3s; }
   .content-title { text-align: center; font-size: 18px; font-weight: 700; margin-bottom: 22px; color: var(--tc); }
@@ -144,6 +166,13 @@ READING_HTML = r"""
   .empty-state { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; pointer-events: none; }
   .empty-state .icon { font-size: 40px; }
   .empty-state .text { font-size: 13px; opacity: 0.35; color: var(--tc); }
+
+  .reading-controls { display: none; justify-content: center; align-items: center; gap: 10px; padding: 8px 20px 14px; flex-shrink: 0; }
+  .reading-controls.visible { display: flex; }
+  .rc-group { display: flex; align-items: center; gap: 2px; background: var(--btn-bg); border-radius: 8px; padding: 2px 4px; }
+  .rc-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 6px; border: none; cursor: pointer; font-size: 12px; font-weight: 600; background: transparent; color: var(--tc); transition: background .15s; }
+  .rc-btn:hover { background: rgba(128,128,128,0.15); }
+  .rc-label { font-size: 11px; min-width: 22px; text-align: center; color: var(--tc); opacity: 0.7; }
 </style>
 </head>
 <body>
@@ -151,11 +180,9 @@ READING_HTML = r"""
 <div class="wrapper">
   <div class="toolbar" id="toolbar">
     <span class="toolbar-title" id="tbTitle">起点阅读 — 等待内容</span>
-    <button class="tb-btn" id="btnFontDown" title="缩小字体">A-</button>
-    <span class="tb-label" id="fontLabel">18</span>
-    <button class="tb-btn" id="btnFontUp" title="放大字体">A+</button>
-    <button class="tb-btn" id="btnTheme" title="切换主题">☀️</button>
-    <button class="tb-btn close" id="btnClose" title="关闭">✕</button>
+    <button class="win-btn" id="btnMin" title="最小化">&#x2014;</button>
+    <button class="win-btn" id="btnMax" title="最大化">&#x25A1;</button>
+    <button class="win-btn close" id="btnClose" title="关闭">&#x2715;</button>
   </div>
 
   <div class="content" id="contentEl">
@@ -167,6 +194,15 @@ READING_HTML = r"""
     <div class="content-title" id="contentTitle" style="display:none"></div>
     <div class="content-body" id="contentBody"></div>
     <div class="end-marker" id="endMarker" style="display:none">— END —</div>
+  </div>
+
+  <div class="reading-controls" id="readingControls">
+    <div class="rc-group">
+      <button class="rc-btn" id="btnFontDown" title="缩小字体">A-</button>
+      <span class="rc-label" id="fontLabel">18</span>
+      <button class="rc-btn" id="btnFontUp" title="放大字体">A+</button>
+    </div>
+    <button class="rc-btn" id="btnTheme" title="切换主题" style="width:32px;height:32px;font-size:14px">🌙</button>
   </div>
 </div>
 
@@ -188,9 +224,28 @@ READING_HTML = r"""
     document.getElementById("contentBody").innerHTML = content;
     document.getElementById("endMarker").style.display = "block";
     document.getElementById("tbTitle").textContent = title;
+    document.getElementById("readingControls").classList.add("visible");
   }
 
-  // ── 按钮 ──
+  // ── 窗口控制按钮 ──
+  document.getElementById("btnMin").addEventListener("click", function(e){
+    e.stopPropagation();
+    window.pywebview.api.minimize();
+  });
+  document.getElementById("btnMax").addEventListener("click", function(e){
+    e.stopPropagation();
+    window.pywebview.api.toggle_maximize();
+  });
+  document.getElementById("btnClose").addEventListener("click", function(e){
+    e.stopPropagation();
+    window.pywebview.api.close();
+  });
+
+  document.addEventListener("keydown", function(e){
+    if (e.key === "Escape") window.pywebview.api.close();
+  });
+
+  // ── 阅读控制按钮（底部浮动栏） ──
   document.getElementById("btnFontDown").addEventListener("click", function(){
     fontSize = Math.max(14, fontSize - 2);
     document.getElementById("contentEl").style.setProperty("--font", fontSize + "px");
@@ -204,13 +259,6 @@ READING_HTML = r"""
   document.getElementById("btnTheme").addEventListener("click", function(){
     var list = ["light","dark","sepia"];
     applyTheme(list[(list.indexOf(theme) + 1) % 3]);
-  });
-  document.getElementById("btnClose").addEventListener("click", function(){
-    window.pywebview.api.close();
-  });
-
-  document.addEventListener("keydown", function(e){
-    if (e.key === "Escape") window.pywebview.api.close();
   });
 
   // ── 拖拽：JS 跟踪屏幕坐标 → Python SetWindowPos ──
