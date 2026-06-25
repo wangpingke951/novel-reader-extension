@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 透明窗口 */
+html, body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: transparent !important;
+}
+
+/* 阅读窗滚动条 */
+.reader-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.reader-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.reader-scroll::-webkit-scrollbar-thumb {
+  background: #c4b5fd;
+  border-radius: 3px;
+}
+
+/* 阅读内容排版 */
+.reader-content p {
+  text-indent: 2em;
+  margin-bottom: 0.5em;
+}
+.reader-content p:empty {
+  display: none;
+}
