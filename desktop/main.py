@@ -213,20 +213,6 @@ READING_HTML = r"""
     if (e.key === "Escape") window.pywebview.api.close();
   });
 
-  // ── 诊断信息 ──
-  var debugEl = document.createElement("div");
-  debugEl.style.cssText = "position:fixed;bottom:8px;left:12px;font-size:10px;opacity:0.5;color:var(--tc);pointer-events:none;z-index:9999;max-width:420px;line-height:1.4";
-  document.body.appendChild(debugEl);
-
-  function dlog(msg) {
-    console.log("[READER]", msg);
-    debugEl.textContent = "[诊断] " + msg;
-    setTimeout(function(){ if (debugEl.textContent === "[诊断] " + msg) debugEl.textContent = ""; }, 3000);
-  }
-
-  // 检查 pywebview API 是否可用
-  dlog("pywebview=" + (typeof window.pywebview) + " api=" + (typeof (window.pywebview && window.pywebview.api)));
-
   // ── 拖拽：JS 跟踪屏幕坐标 → Python SetWindowPos ──
   (function(){
     var toolbar = document.getElementById("toolbar");
@@ -235,12 +221,9 @@ READING_HTML = r"""
     toolbar.addEventListener("mousedown", function(e){
       if (e.target.tagName === "BUTTON") return;
       dragging = true;
-      dlog("drag start @ " + e.screenX + "," + e.screenY);
       try {
         window.pywebview.api.start_drag(e.screenX, e.screenY);
-      } catch(err) {
-        dlog("❌ start_drag 失败: " + err.message);
-      }
+      } catch(err) { /* 忽略 */ }
       e.preventDefault();
     });
 
@@ -248,14 +231,11 @@ READING_HTML = r"""
       if (!dragging) return;
       try {
         window.pywebview.api.drag_to(e.screenX, e.screenY);
-      } catch(err) { /* 静默，避免拖拽时日志刷屏 */ }
+      } catch(err) { /* 忽略 */ }
     });
 
     document.addEventListener("mouseup", function(){
-      if (dragging) {
-        dragging = false;
-        dlog("drag end");
-      }
+      dragging = false;
     });
   })();
 </script>
