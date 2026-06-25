@@ -25,6 +25,7 @@ user32 = ctypes.windll.user32
 
 # ── 全局状态 ──
 window = None
+pending_request_url = None
 
 def make_transparent():
     """设置窗口为分层窗口以支持透明"""
@@ -92,6 +93,12 @@ class ReaderApi:
         # SWP_NOZORDER: 不改变 Z 序；SWP_NOSIZE: 不改变尺寸；SWP_NOACTIVATE: 不激活
         user32.SetWindowPos(hwnd, 0, new_x, new_y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
 
+    def request_chapter(self, url):
+        """将章节 URL 写入待请求队列，由浏览器 content script 轮询获取"""
+        global pending_request_url
+        pending_request_url = url
+        print(f"[REQUEST] 待请求章节: {url}")
+
     def debug_ping(self):
         """诊断：确认 JS→Python 通信正常"""
         print("[DEBUG] ping 成功 — JS→Python 通信正常")
@@ -111,6 +118,17 @@ def health():
     response.content_type = "application/json"
     return json.dumps({"status": "ok"})
 
+@http_app.route("/api/pending-request")
+def pending_request():
+    """浏览器 content script 轮询此端点获取待请求的章节 URL"""
+    global pending_request_url
+    response.content_type = "application/json"
+    if pending_request_url:
+        url = pending_request_url
+        pending_request_url = None
+        return json.dumps({"url": url})
+    return json.dumps({"url": None})
+
 @http_app.route("/api/content", method=["POST", "OPTIONS"])
 def receive_content():
     if request.method == "OPTIONS":
@@ -121,8 +139,10 @@ def receive_content():
         return json.dumps({"error": "no data"})
     title = json.dumps(data.get("title", ""))
     content = json.dumps(data.get("content", ""))
+    next_url = json.dumps(data.get("nextUrl") or "")
+    prev_url = json.dumps(data.get("prevUrl") or "")
     if window:
-        window.evaluate_js(f"updateContent({title}, {content})")
+        window.evaluate_js(f"updateContent({title}, {content}, {next_url}, {prev_url})")
     response.content_type = "application/json"
     return json.dumps({"status": "ok"})
 
@@ -173,6 +193,17 @@ READING_HTML = r"""
   .rc-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 6px; border: none; cursor: pointer; font-size: 12px; font-weight: 600; background: transparent; color: var(--tc); transition: background .15s; }
   .rc-btn:hover { background: rgba(128,128,128,0.15); }
   .rc-label { font-size: 11px; min-width: 22px; text-align: center; color: var(--tc); opacity: 0.7; }
+  .rc-btn:disabled { opacity: 0.25; cursor: default; }
+  .rc-btn:disabled:hover { background: transparent; }
+  .rc-nav { width: 32px; height: 28px; font-size: 13px; }
+
+  .toast {
+    position: fixed; bottom: 56px; left: 50%; transform: translateX(-50%);
+    padding: 6px 14px; background: rgba(0,0,0,0.78); color: #fff;
+    font-size: 12px; border-radius: 6px; z-index: 9999;
+    pointer-events: none; white-space: nowrap;
+    transition: opacity .25s;
+  }
 </style>
 </head>
 <body>
@@ -198,17 +229,26 @@ READING_HTML = r"""
 
   <div class="reading-controls" id="readingControls">
     <div class="rc-group">
+      <button class="rc-btn rc-nav" id="btnPrev" title="上一章" disabled>◀</button>
+    </div>
+    <div class="rc-group">
       <button class="rc-btn" id="btnFontDown" title="缩小字体">A-</button>
       <span class="rc-label" id="fontLabel">18</span>
       <button class="rc-btn" id="btnFontUp" title="放大字体">A+</button>
     </div>
     <button class="rc-btn" id="btnTheme" title="切换主题" style="width:32px;height:32px;font-size:14px">🌙</button>
+    <div class="rc-group">
+      <button class="rc-btn rc-nav" id="btnNext" title="下一章" disabled>▶</button>
+    </div>
   </div>
 </div>
 
 <script>
   let fontSize = 18;
   let theme = "dark";
+  let currentNextUrl = null;
+  let currentPrevUrl = null;
+  let isLoadingChapter = false;
 
   function applyTheme(t) {
     theme = t;
@@ -216,7 +256,8 @@ READING_HTML = r"""
     document.getElementById("btnTheme").textContent = t === "light" ? "☀️" : t === "dark" ? "🌙" : "📜";
   }
 
-  function updateContent(title, content) {
+  function updateContent(title, content, nextUrl, prevUrl) {
+    clearToast();
     document.getElementById("emptyState").style.display = "none";
     var tEl = document.getElementById("contentTitle");
     tEl.style.display = "block";
@@ -225,6 +266,38 @@ READING_HTML = r"""
     document.getElementById("endMarker").style.display = "block";
     document.getElementById("tbTitle").textContent = title;
     document.getElementById("readingControls").classList.add("visible");
+
+    currentNextUrl = nextUrl || null;
+    currentPrevUrl = prevUrl || null;
+    isLoadingChapter = false;
+    updateNavButtons();
+    document.getElementById("contentEl").scrollTop = 0;
+  }
+
+  function updateNavButtons() {
+    document.getElementById("btnNext").disabled = !currentNextUrl;
+    document.getElementById("btnPrev").disabled = !currentPrevUrl;
+  }
+
+  function setLoadingComplete() {
+    isLoadingChapter = false;
+  }
+
+  function showToast(msg, type) {
+    clearToast();
+    var el = document.createElement("div");
+    el.className = "toast";
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(function() {
+      el.style.opacity = "0";
+      setTimeout(function() { if (el.parentNode) el.remove(); }, 300);
+    }, 3000);
+  }
+
+  function clearToast() {
+    var existing = document.querySelector(".toast");
+    if (existing) existing.remove();
   }
 
   // ── 窗口控制按钮 ──
@@ -259,6 +332,20 @@ READING_HTML = r"""
   document.getElementById("btnTheme").addEventListener("click", function(){
     var list = ["light","dark","sepia"];
     applyTheme(list[(list.indexOf(theme) + 1) % 3]);
+  });
+
+  // ── 章节导航按钮 ──
+  document.getElementById("btnNext").addEventListener("click", function(){
+    if (!currentNextUrl || isLoadingChapter) return;
+    isLoadingChapter = true;
+    showToast("正在加载下一章…");
+    window.pywebview.api.request_chapter(currentNextUrl);
+  });
+  document.getElementById("btnPrev").addEventListener("click", function(){
+    if (!currentPrevUrl || isLoadingChapter) return;
+    isLoadingChapter = true;
+    showToast("正在加载上一章…");
+    window.pywebview.api.request_chapter(currentPrevUrl);
   });
 
   // ── 拖拽：JS 跟踪屏幕坐标 → Python SetWindowPos ──

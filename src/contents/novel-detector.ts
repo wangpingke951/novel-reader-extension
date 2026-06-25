@@ -150,6 +150,64 @@ function cleanAndBuildHtml(rawElement: Element): string | null {
   return merged.map((p) => `<p>${p}</p>`).join("");
 }
 
+/* ─── 章节导航 ─── */
+
+function extractNavigationUrls(): { nextUrl: string | null; prevUrl: string | null } {
+  let nextUrl: string | null = null;
+  let prevUrl: string | null = null;
+
+  const tryGetUrl = (el: Element | null, targetText: string): string | null => {
+    if (!el) return null;
+    const text = el.textContent?.trim() || "";
+    const href = (el as HTMLAnchorElement).href;
+    if (text.includes(targetText) && href && href.includes("/chapter/")) return href;
+    return null;
+  };
+
+  // 新版起点：具体选择器
+  const next1 = document.querySelector("#reader-content > div > div > div.mx-64px.pb-64px.mt-auto > div > a:nth-child(2)");
+  const prev1 = document.querySelector("#reader-content > div > div > div.mx-64px.pb-64px.mt-auto > div > a:nth-child(1)");
+  nextUrl = tryGetUrl(next1, "下一章");
+  prevUrl = tryGetUrl(prev1, "上一章");
+
+  // 新版起点：.nav-btn-group a.nav-btn
+  if (!nextUrl || !prevUrl) {
+    const navBtns = document.querySelectorAll(".nav-btn-group a.nav-btn");
+    navBtns.forEach((btn) => {
+      const text = btn.textContent?.trim() || "";
+      const href = (btn as HTMLAnchorElement).href;
+      if (text.includes("下一章") && href && !nextUrl) nextUrl = href;
+      else if (text.includes("上一章") && href && !prevUrl) prevUrl = href;
+    });
+  }
+
+  // 旧版：直接搜索所有 <a>
+  if (!nextUrl || !prevUrl) {
+    document.querySelectorAll("a").forEach((a) => {
+      const text = a.textContent?.trim() || "";
+      const href = (a as HTMLAnchorElement).href;
+      if (text === "下一章" && href && !nextUrl) nextUrl = href;
+      else if (text === "上一章" && href && !prevUrl) prevUrl = href;
+    });
+  }
+
+  return { nextUrl, prevUrl };
+}
+
+interface ContentPayload {
+  title: string;
+  content: string;
+  nextUrl: string | null;
+  prevUrl: string | null;
+}
+
+function extractFull(): ContentPayload | null {
+  const base = extract();
+  if (!base) return null;
+  const nav = extractNavigationUrls();
+  return { ...base, ...nav };
+}
+
 /* ─── 浮动按钮 ─── */
 
 function injectButton(): void {
@@ -180,8 +238,8 @@ function injectButton(): void {
     btn.textContent = "⏳";
     btn.style.pointerEvents = "none";
     try {
-      // Step 1: 提取内容
-      const data = extract();
+      // Step 1: 提取内容 + 上下章链接
+      const data = extractFull();
       if (!data) {
         toast("❌ 未识别到章节内容");
         btn.textContent = "📖";
@@ -218,7 +276,14 @@ function injectButton(): void {
 
 const DESKTOP_URL = "http://127.0.0.1:19876/api/content";
 
-async function sendToDesktopApp(data: { title: string; content: string }): Promise<boolean> {
+interface DesktopPayload {
+  title: string;
+  content: string;
+  nextUrl?: string | null;
+  prevUrl?: string | null;
+}
+
+async function sendToDesktopApp(data: DesktopPayload): Promise<boolean> {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 2000);
@@ -238,11 +303,184 @@ async function sendToDesktopApp(data: { title: string; content: string }): Promi
   }
 }
 
+/* ─── 浏览器端章节代理抓取 ─── */
+
+const PENDING_URL = "http://127.0.0.1:19876/api/pending-request";
+
+/**
+ * 用浏览器 Cookie 抓取章节页面 HTML，解析后发回桌面
+ */
+async function fetchAndSendChapter(url: string): Promise<void> {
+  try {
+    console.log("[起点阅读] 代理抓取章节:", url);
+    const resp = await fetch(url, { credentials: "include" });
+    if (!resp.ok) {
+      console.error("[起点阅读] 抓取失败:", resp.status);
+      return;
+    }
+    const html = await resp.text();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, "text/html");
+
+    // 提取标题
+    let title = "";
+    const titleSelectors = [
+      "#reader-content h3", "#reader-content h2", "#reader-content h1",
+      ".j_chapterName", "h3.j_chapterName", ".content-wrap h3",
+      "h1", "h2", "h3", ".chapter-title", ".text-title",
+    ];
+    for (const sel of titleSelectors) {
+      const el = doc.querySelector(sel);
+      if (el?.textContent?.trim()) {
+        title = el.textContent.trim();
+        break;
+      }
+    }
+    if (!title) title = doc.title || "未命名章节";
+
+    // 提取内容
+    let container: Element | null = null;
+    const reviewEl = doc.querySelector("#reader-content .enable-review");
+    if (reviewEl && (reviewEl.textContent?.trim().length || 0) > 50) {
+      container = reviewEl;
+    }
+    if (!container) {
+      const selectors = [
+        "#reader-content .enable-review", "#reader-content",
+        ".read-content", ".j_readContent", "#chaptercontent",
+      ];
+      let bestLen = 0;
+      for (const sel of selectors) {
+        const el = doc.querySelector(sel);
+        const text = el?.textContent?.trim() || "";
+        if (text.length > bestLen) { bestLen = text.length; container = el; }
+      }
+    }
+
+    if (!container) {
+      console.error("[起点阅读] 代理抓取：找不到内容容器");
+      return;
+    }
+
+    // 复用 cleanAndBuildHtml 逻辑（对 parsed doc）
+    const content = cleanParsedHtml(container);
+    if (!content) {
+      console.error("[起点阅读] 代理抓取：内容为空");
+      return;
+    }
+
+    // 提取导航链接
+    let nextUrl: string | null = null;
+    let prevUrl: string | null = null;
+    const tryGet = (el: Element | null, t: string): string | null => {
+      if (!el) return null;
+      const txt = el.textContent?.trim() || "";
+      const href = (el as HTMLAnchorElement).href;
+      if (txt.includes(t) && href && href.includes("/chapter/")) return href;
+      return null;
+    };
+    nextUrl = tryGet(doc.querySelector("#reader-content > div > div > div.mx-64px.pb-64px.mt-auto > div > a:nth-child(2)"), "下一章");
+    prevUrl = tryGet(doc.querySelector("#reader-content > div > div > div.mx-64px.pb-64px.mt-auto > div > a:nth-child(1)"), "上一章");
+    if (!nextUrl || !prevUrl) {
+      doc.querySelectorAll(".nav-btn-group a.nav-btn").forEach((btn) => {
+        const t = btn.textContent?.trim() || "";
+        const h = (btn as HTMLAnchorElement).href;
+        if (t.includes("下一章") && h && !nextUrl) nextUrl = h;
+        else if (t.includes("上一章") && h && !prevUrl) prevUrl = h;
+      });
+    }
+
+    // 发送到桌面
+    await fetch(DESKTOP_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, content, nextUrl, prevUrl }),
+    });
+    console.log("[起点阅读] 代理抓取完成:", title);
+  } catch (err: any) {
+    console.error("[起点阅读] 代理抓取异常:", err.message || String(err));
+  }
+}
+
+/**
+ * 对 DOMParser 解析出的元素进行清洗（镜像 cleanAndBuildHtml）
+ */
+function cleanParsedHtml(rawElement: Element): string | null {
+  const clone = rawElement.cloneNode(true) as HTMLElement;
+  const NOISE_TAGS = ["style", "script", "svg", "img", "button", "input",
+    "canvas", "iframe", "noscript", "video", "audio"];
+  for (const tag of NOISE_TAGS) {
+    clone.querySelectorAll(tag).forEach((n) => n.remove());
+  }
+  const walker = document.createTreeWalker(clone, NodeFilter.SHOW_ELEMENT);
+  const toRemove: Element[] = [];
+  while (walker.nextNode()) {
+    const el = walker.currentNode as Element;
+    if (el.children.length === 0) {
+      const text = el.textContent?.trim() || "";
+      if (text.length <= 4 && /^\d+$/.test(text)) toRemove.push(el);
+    }
+  }
+  toRemove.forEach((el) => el.remove());
+
+  const pEls = clone.querySelectorAll("p");
+  const paragraphs: string[] = [];
+  for (const pEl of pEls) {
+    const text = pEl.textContent?.replace(/[\s　]+/g, " ").trim() || "";
+    if (!text || text.length < 2 || /^\d+$/.test(text)) continue;
+    paragraphs.push(text);
+  }
+  if (paragraphs.length < 3) {
+    const rawText = clone.textContent || "";
+    const fallback = rawText
+      .split(/\n\s*\n|\n{2,}/)
+      .map((p) => p.replace(/[\s　]+/g, " ").trim())
+      .filter((p) => p.length >= 2 && !/^\d+$/.test(p));
+    paragraphs.length = 0;
+    paragraphs.push(...fallback);
+  }
+  if (paragraphs.length === 0) return null;
+
+  const merged: string[] = [];
+  for (const p of paragraphs) {
+    const last = merged[merged.length - 1];
+    if (last && last.length < 10 && !/[。！？.!?]$/.test(last)) {
+      merged[merged.length - 1] = last + p;
+    } else {
+      merged.push(p);
+    }
+  }
+  const totalLen = merged.reduce((s, p) => s + p.length, 0);
+  if (totalLen < 50) return null;
+  return merged.map((p) => `<p>${p}</p>`).join("");
+}
+
+/** 轮询桌面端待请求队列 */
+let pollingTimer: ReturnType<typeof setInterval> | null = null;
+
+function startPolling(): void {
+  if (pollingTimer) return;
+  pollingTimer = setInterval(async () => {
+    try {
+      const res = await fetch(PENDING_URL);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.url) {
+        console.log("[起点阅读] 轮询到待请求URL:", data.url);
+        await fetchAndSendChapter(data.url);
+      }
+    } catch {
+      // 桌面未启动时静默
+    }
+  }, 2000);
+  console.log("[起点阅读] 轮询已启动");
+}
+
 /* ─── 悬浮阅读面板 ─── */
 
 let panelActive = false;
 
-function injectReadingPanel(data: { title: string; content: string }): void {
+function injectReadingPanel(data: ContentPayload): void {
   // 移除旧面板
   const old = document.getElementById("__nr_panel");
   if (old) old.remove();
@@ -312,6 +550,8 @@ function injectReadingPanel(data: { title: string; content: string }): void {
     .toolbar-title.sepia { color: #5b4636; }
     .btn { width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; border-radius: 6px; border: none; cursor: pointer; font-size: 11px; font-weight: 600; background: transparent; transition: background .15s; }
     .btn:hover { background: rgba(0,0,0,0.08); }
+    .btn:disabled { opacity: 0.25; cursor: default; }
+    .btn:disabled:hover { background: transparent; }
     .btn-close:hover { background: rgba(239,68,68,0.12); color: #ef4444; }
     .btn-light { color: #374151; }
     .btn-dark { color: #e5e7eb; }
@@ -336,11 +576,13 @@ function injectReadingPanel(data: { title: string; content: string }): void {
     <div class="backdrop"></div>
     <div class="container">
       <div class="toolbar" id="__nr_drag_handle">
+        <button class="btn btn-light" id="__nr_btn_prev" title="上一章（仅桌面窗支持）" disabled>◀</button>
         <span class="toolbar-title light" id="__nr_tb_title">${escapeHtml(data.title)}</span>
         <button class="btn btn-light" id="__nr_btn_font_down" title="缩小字体">A-</button>
         <span class="btn btn-light" id="__nr_font_label" style="width:auto;min-width:24px;cursor:default;font-size:11px;">18</span>
         <button class="btn btn-light" id="__nr_btn_font_up" title="放大字体">A+</button>
         <button class="btn btn-light" id="__nr_btn_theme" title="切换主题">☀️</button>
+        <button class="btn btn-light" id="__nr_btn_next" title="下一章（仅桌面窗支持）" disabled>▶</button>
         <button class="btn btn-light btn-close" id="__nr_btn_close" title="关闭 (Esc)">✕</button>
       </div>
       <div class="content light" id="__nr_content">
@@ -365,6 +607,12 @@ function injectReadingPanel(data: { title: string; content: string }): void {
   const fontLabel = shadow.getElementById("__nr_font_label")!;
   const btnTheme = shadow.getElementById("__nr_btn_theme")!;
   const themeButtons = shadow.querySelectorAll(".btn") as NodeListOf<HTMLElement>;
+  const btnPrev = shadow.getElementById("__nr_btn_prev") as HTMLButtonElement;
+  const btnNext = shadow.getElementById("__nr_btn_next") as HTMLButtonElement;
+
+  // 导航按钮状态
+  btnPrev.disabled = !data.prevUrl;
+  btnNext.disabled = !data.nextUrl;
 
   // 更新主题
   function applyTheme(t: "light" | "dark" | "sepia") {
@@ -478,6 +726,7 @@ function init(): void {
   console.log("[起点阅读] init, hostname:", window.location.hostname);
   if (ENABLE_TEST_ALL || isNovelSite()) {
     injectButton();
+    startPolling();
   }
 }
 
